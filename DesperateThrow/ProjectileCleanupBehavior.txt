@@ -1,0 +1,217 @@
+
+【ProjectileBottleneckPatches.cs】
+﻿using DesperateThrow;
+using HarmonyLib; 
+using SandBox.GameComponents;
+using TaleWorlds.Core;
+using TaleWorlds.Library;
+using TaleWorlds.MountAndBlade;
+using TaleWorlds.MountAndBlade.ComponentInterfaces;
+
+namespace DesperateThrow
+{
+    [HarmonyPatch]
+    public static class ProjectileBottleneckPatches
+    {
+        [HarmonyPatch(typeof(Agent), "DropItem")]
+        [HarmonyPrefix]
+        public static bool Prefix(Agent __instance,EquipmentIndex itemIndex, WeaponClass pickedUpItemType = WeaponClass.Undefined)
+        {
+            Agent playerAgent = Agent.Main;
+            if (playerAgent != null && playerAgent.IsPlayerControlled)
+            {
+                WeaponClass weaponClass= __instance.Equipment[itemIndex].CurrentUsageItem.WeaponClass;
+                switch (weaponClass)
+                { 
+                    case WeaponClass.Dagger:
+                    case WeaponClass.OneHandedSword:
+                    case WeaponClass.OneHandedAxe:
+                    case WeaponClass.Mace:
+                        break;
+                    case WeaponClass.TwoHandedMace:
+                    case WeaponClass.TwoHandedSword:
+                    case WeaponClass.TwoHandedAxe:
+                        break;
+                    case WeaponClass.Pick:
+                    case WeaponClass.OneHandedPolearm:
+                    case WeaponClass.TwoHandedPolearm:
+                    case WeaponClass.LowGripPolearm:
+                        break; 
+                    case WeaponClass.ThrowingAxe: 
+                    case WeaponClass.ThrowingKnife: 
+                    case WeaponClass.Javelin:
+                        break; 
+                    default:
+                        break;
+                }
+            }
+
+            // 返回false跳过原方法
+            return true;
+        }
+
+        /// <summary>
+        /// 拦截底层投射物生成函数，捕获引擎分配的真实 Index
+        /// 目标方法：Mission.AddMissileAux (...)
+        /// </summary>
+        [HarmonyPatch(typeof(Mission), "AddMissileAux")]
+        [HarmonyPostfix]
+        public static void Postfix_CaptureMissileIndex(
+            int __result,               // 返回值：引擎分配的 Missile Index
+            bool isPrediction,          // 参数：是否为预测弹道
+            Agent shooterAgent)         // 参数：发射者
+        {
+            // 1. 过滤无效情况：预测弹道、空射手、无效索引
+            if (isPrediction || shooterAgent == null || __result < 0)
+                return;
+
+            // 2. 获取当前手持武器的伤害
+            // 此时 Agent 的 WieldedItemIndex 通常已经锁定为正在使用的武器
+            EquipmentIndex wieldedItemIndex = shooterAgent.GetPrimaryWieldedItemIndex();
+
+            // 兼容副手武器（如某些特殊投掷动作）
+            if (wieldedItemIndex == EquipmentIndex.None)
+                wieldedItemIndex = shooterAgent.GetOffhandWieldedItemIndex( );
+
+            if (wieldedItemIndex != EquipmentIndex.None)
+            {
+                MissionWeapon weapon = shooterAgent.Equipment[wieldedItemIndex];
+                // 获取经过技能、属性修正后的最终导弹伤害
+                int weaponDamage = weapon.GetModifiedMissileDamageForCurrentUsage();
+
+                // 3. 记录映射关系
+                ProjectileDamageStore.Record(__result, weaponDamage);
+            }
+        }
+
+        /// <summary>
+        /// 拦截伤害计算模型，注入武器伤害
+        /// 覆盖战役模式 (Sandbox) 和 自定义战斗 (Default)
+        /// </summary>
+        [HarmonyPatch(typeof(SandboxStrikeMagnitudeModel), "CalculateStrikeMagnitudeForMissile")]
+        [HarmonyPatch(typeof(DefaultStrikeMagnitudeModel), "CalculateStrikeMagnitudeForMissile")]
+        [HarmonyPostfix]
+        public static void Postfix_InjectDamage(
+            ref float __result,
+            in AttackCollisionData collisionData,
+            in MissionWeapon weapon) // 这里的 weapon 参数通常指弹药本身，而非发射器
+        {
+            int missileIndex = collisionData.AffectorWeaponSlotOrMissileIndex;
+
+            // 尝试从字典中获取之前记录的武器伤害
+            if (ProjectileDamageStore.MissileWeaponDamageMap.TryGetValue(missileIndex, out int extraWeaponDamage))
+            {
+                float ammoDamage = collisionData.MissileTotalDamage;
+
+                // 防御性编程：避免除以零
+                if (ammoDamage <= 0f) ammoDamage = 1f;
+
+                // --- 核心修正公式 ---
+                // 原理：原生结果 (__result) 是基于纯弹药伤害计算的冲击力。
+                // 我们通过比例放大，将武器伤害无缝融入，同时保留速度衰减、距离衰减等物理效果。
+                // 公式：新冲击力 = 原冲击力 * (弹药伤害 + 武器伤害) / 弹药伤害
+                __result = (__result / ammoDamage) * (ammoDamage + extraWeaponDamage);
+            }
+        }
+    }
+}
+========================================
+
+【ProjectileCleanupBehavior.cs】
+﻿using DesperateThrow;
+using TaleWorlds.Core;
+using TaleWorlds.InputSystem;
+using TaleWorlds.Library;
+using TaleWorlds.MountAndBlade;
+
+namespace DesperateThrow
+{
+    public class ProjectileCleanupBehavior : MissionLogic
+    {
+        // 当投射物命中时，立即清理对应的数据
+        public override void OnMissileHit(Agent attacker, Agent victim, bool isCanceled, AttackCollisionData collisionData)
+        {
+            base.OnMissileHit(attacker, victim, isCanceled, collisionData);
+            if (!isCanceled)
+            {
+                ProjectileDamageStore.Remove(collisionData.AffectorWeaponSlotOrMissileIndex);
+            }
+        }
+
+        // 当投射物消失（未命中或超出范围）时，引擎通常会调用相关事件，
+        // 但为了保险起见，我们在 Mission 结束时统一清空
+        protected override void OnEndMission()
+        {
+            base.OnEndMission();
+            ProjectileDamageStore.Clear();
+        }
+
+        public override void OnMissionModeChange(MissionMode oldMode, bool atStart)
+        {
+            base.OnMissionModeChange(oldMode, atStart);
+            if (atStart) ProjectileDamageStore.Clear();
+        }
+ 
+
+    }
+}
+========================================
+
+【ProjectileDamageStore.cs】
+﻿using System.Collections.Generic;
+
+namespace DesperateThrow
+{
+    public static class ProjectileDamageStore
+    {
+        // 映射：Missile Index -> 该投射物对应的武器基础伤害
+        // 使用 Dictionary 保证 O(1) 的读写效率
+        public static Dictionary<int, int> MissileWeaponDamageMap = new Dictionary<int, int>();
+
+        public static void Record(int index, int damage)
+        {
+            if (index >= 0)
+                MissileWeaponDamageMap[index] = damage;
+        }
+
+        public static void Remove(int index)
+        {
+            if (index >= 0 && MissileWeaponDamageMap.ContainsKey(index))
+                MissileWeaponDamageMap.Remove(index);
+        }
+
+        public static void Clear() => MissileWeaponDamageMap.Clear();
+    }
+}
+========================================
+
+【SubModule.cs】
+﻿using DesperateThrow;
+using HarmonyLib;
+using TaleWorlds.MountAndBlade;
+
+namespace DesperateThrow
+{
+    public class SubModule : MBSubModuleBase
+    {
+        protected override void OnSubModuleLoad()
+        {
+            base.OnSubModuleLoad();
+
+            // 初始化 Harmony 并应用所有补丁
+            var harmony = new Harmony("com.projectile.system.bottleneck");
+            harmony.PatchAll();
+             
+        }
+
+        public override void OnMissionBehaviorInitialize(Mission mission)
+        {
+            base.OnMissionBehaviorInitialize(mission);
+
+            // 注册清理逻辑
+            // 注意：核心的索引捕获已由 Harmony 在底层完成，此处仅需清理
+            mission.AddMissionBehavior(new ProjectileCleanupBehavior());
+        }
+    }
+}
+========================================
